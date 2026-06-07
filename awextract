@@ -1,0 +1,150 @@
+#!/usr/bin/env bash
+#
+# awextract - unpack an Allwinner IMAGEWTY firmware image (.awimg, as used by
+#             LiveSuit / PhoenixSuit / sunxi `pack`).
+#
+# It does two things:
+#   1. Writes every stored .fex data blob to <outdir>/ (the raw partition /
+#      component images, e.g. rootfs.fex, boot.fex, boot-resource.fex, ...).
+#   2. For blobs that are actually filesystems (ext2/3/4 or FAT), it ALSO
+#      produces <name>.tar.gz of their contents -- so rootfs.fex is kept and
+#      rootfs.fex.tar.gz is created alongside it, likewise for the FAT image.
+#
+# Filesystems are read rootless via FUSE (fuse2fs for ext, fusefat for FAT);
+# tars use --numeric-owner so uid/gid/mode are preserved. No sudo required.
+#
+# Usage:
+#   awextract <image.awimg> [outdir]     unpack blobs (+ tar.gz for filesystems)
+#   awextract -l|--list <image.awimg>    just list the IMAGEWTY file table
+#
+# outdir defaults to the image basename without its extension.
+#
+# Dependencies:
+#   python3      parse the IMAGEWTY file table
+#   dd           extract raw blobs from the image
+#   tar          archive filesystem contents
+#   fuse2fs      mount ext2/3/4 blobs rootlessly (e2fsprogs / fuse2fs package)
+#   fusefat      mount FAT blobs rootlessly (fatctl / fuse-fat package)
+#   fusermount3  unmount FUSE mounts (fuse3 package; falls back to fusermount)
+#   simg2img     unsparse Android sparse images before mounting (android-sdk-libsparse-utils)
+#
+set -euo pipefail
+prog=${0##*/}
+die(){ echo "$prog: $*" >&2; exit 1; }
+usage(){ sed -n '3,26p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-1}"; }
+
+LIST_ONLY=0; ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage 0 ;;
+    -l|--list) LIST_ONLY=1; shift ;;
+    --)        shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done ;;
+    -*)        die "unknown option: $1" ;;
+    *)         ARGS+=("$1"); shift ;;
+  esac
+done
+[ "${#ARGS[@]}" -ge 1 ] || usage 1
+IMG="${ARGS[0]}"; [ -f "$IMG" ] || die "no such file: $IMG"
+OUTDIR="${ARGS[1]:-}"
+if [ -z "$OUTDIR" ]; then b=${IMG##*/}; OUTDIR="${b%.*}"; fi
+
+# ---- parse the IMAGEWTY file table -> TSV: idx \t offset \t length \t type \t name
+parse_table(){
+python3 - "$IMG" <<'PY'
+import sys, struct, mmap
+f = open(sys.argv[1], 'rb'); m = mmap.mmap(f.fileno(), 0, prot=mmap.PROT_READ); N = len(m)
+u = lambda o: struct.unpack('<I', m[o:o+4])[0]
+if m[:8] != b'IMAGEWTY':
+    sys.stderr.write("not an IMAGEWTY/.awimg image (no magic)\n"); sys.exit(2)
+num = u(60)                                   # number of file headers
+# v0x0300 file header record = 1024 bytes, starting at 1024:
+#   +0x00 filename_len  +0x04 total_header_size(=1024)
+#   +0x08 maintype[8]   +0x10 subtype[16]   +0x24 original filename
+#   +0x12c stored length            +0x134 absolute offset in image
+def classify(off, length):
+    if off <= 0 or off >= N or off + min(length, 2048) > N:
+        return '-'
+    if length >= 28 and m[off:off+4] == b'\x3a\xff\x26\xed':        # Android sparse
+        return 'sparse'
+    if length >= 2048 and m[off+1080:off+1082] == b'\x53\xef':      # ext primary sb
+        if u(off+1024+24) <= 6 and struct.unpack('<H', m[off+1024+88:off+1024+90])[0] in (128,256,512,1024):
+            return 'ext'
+    if length >= 512 and m[off+510:off+512] == b'\x55\xaa':         # FAT BPB
+        if m[off+54:off+62] in (b'FAT12   ', b'FAT16   ', b'FAT     ') or m[off+82:off+90] == b'FAT32   ':
+            return 'fat'
+    return '-'
+for k in range(num):
+    e = 1024 + k*1024
+    if e + 1024 > N: break
+    name   = m[e+0x24:e+0x24+256].split(b'\x00')[0].decode('latin1', 'replace')
+    length = u(e+0x12c); off = u(e+0x134)
+    print('%d\t%d\t%d\t%s\t%s' % (k, off, length, classify(off, length), name))
+PY
+}
+
+mapfile -t ROWS < <(parse_table) || die "failed to parse '$IMG'"
+[ "${#ROWS[@]}" -gt 0 ] || die "no file-table entries found in '$IMG'"
+
+if [ "$LIST_ONLY" = 1 ]; then
+  printf '%-3s %-22s %12s %12s  %s\n' "#" NAME OFFSET LENGTH TYPE
+  for r in "${ROWS[@]}"; do IFS=$'\t' read -r idx off len typ name <<<"$r"
+    printf '%-3s %-22s %12s %12s  %s\n' "$idx" "$name" "$off" "$len" \
+      "$(case "$typ" in -) echo "" ;; sparse) echo "[sparse ext filesystem]" ;; *) echo "[$typ filesystem]" ;; esac)"
+  done
+  exit 0
+fi
+
+command -v dd >/dev/null || die "dd not found"
+mkdir -p "$OUTDIR"
+TMPROOT="$OUTDIR/.awextract_mnt"; mkdir -p "$TMPROOT"
+cleanup(){
+  for d in "$TMPROOT"/*/; do [ -d "$d" ] || continue
+    fusermount3 -u "$d" 2>/dev/null || fusermount -u "$d" 2>/dev/null || true
+  done
+  rm -rf "$TMPROOT" 2>/dev/null || true
+}
+trap cleanup EXIT
+
+GZ=(-z)
+
+# rootless mount of a filesystem blob + tar.gz of its contents
+fs_to_targz(){    # <blob> <ext|fat|sparse> <out.tar.gz>
+  local blob=$1 typ=$2 out=$3 mnt raw="" ok=0
+  mnt=$(mktemp -d "$TMPROOT/m.XXXXXX")
+  case "$typ" in
+    ext)    fuse2fs -o ro,fakeroot "$blob" "$mnt" >/dev/null 2>&1 && ok=1 ;;
+    fat)    fusefat  -o ro          "$blob" "$mnt" >/dev/null 2>&1 && ok=1 ;;
+    sparse) raw=$(mktemp "$TMPROOT/sparse.XXXXXX.img")
+            if simg2img "$blob" "$raw" >/dev/null 2>&1; then
+              fuse2fs -o ro,fakeroot "$raw" "$mnt" >/dev/null 2>&1 && ok=1
+            fi ;;
+  esac
+  if [ "$ok" != 1 ]; then echo "    ! mount failed ($typ); skipping tar.gz" >&2; rmdir "$mnt" 2>/dev/null; [ -n "$raw" ] && rm -f "$raw"; return 1; fi
+  tar --numeric-owner --xattrs -p -C "$mnt" "${GZ[@]}" -cf "$out" . 2>/dev/null; local rc=$?
+  fusermount3 -u "$mnt" 2>/dev/null || fusermount -u "$mnt" 2>/dev/null || true
+  rmdir "$mnt" 2>/dev/null
+  [ -n "$raw" ] && rm -f "$raw"
+  return $rc
+}
+
+echo "$prog: unpacking '$IMG' -> $OUTDIR/" >&2
+nfs=0
+for r in "${ROWS[@]}"; do
+  IFS=$'\t' read -r idx off len typ name <<<"$r"
+  [ -n "$name" ] || name="entry_$idx"
+  dest="$OUTDIR/$name"
+  if [ -e "$dest" ]; then                       # disambiguate duplicate names
+    ext=${name##*.}; stem=${name%.*}
+    [ "$ext" = "$name" ] && dest="$OUTDIR/${name}.$idx" || dest="$OUTDIR/${stem}.$idx.$ext"
+  fi
+  dd if="$IMG" of="$dest" bs=4M iflag=skip_bytes,count_bytes skip="$off" count="$len" status=none
+  printf '  [%2s] %-22s %10s bytes' "$idx" "${dest#$OUTDIR/}" "$len" >&2
+  if [ "$typ" != - ]; then
+    printf '  (%s fs -> %s.tar.gz)\n' "$typ" "${dest#$OUTDIR/}" >&2
+    fs_to_targz "$dest" "$typ" "$dest.tar.gz" && nfs=$((nfs+1))
+  else
+    printf '\n' >&2
+  fi
+done
+
+echo "$prog: done. ${#ROWS[@]} blob(s) written, $nfs filesystem(s) tarred, in $OUTDIR/" >&2

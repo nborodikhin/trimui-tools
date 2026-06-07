@@ -1,0 +1,4 @@
+Utility to extract root filesystem from a AllWinner image format used for TrimUI devices (Brick, TSP, TSPS).
+Tested on Linux
+
+Official firmware and toolchains: https://github.com/trimui
