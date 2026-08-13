@@ -1,0 +1,363 @@
+#!/usr/bin/env bash
+# Screenshot a handheld over adb: Android, or a TrimUI / Miyoo Linux device.
+#
+# Three capture paths, probed in order:
+#   screencap  Android's own tool, via SurfaceFlinger (handles rotation/layers)
+#   kms        the scanned-out KMS framebuffer, for anything using DRM
+#   fbdev      /dev/fb0, for stock firmwares and the tg5040
+#
+# The device model does not predict which applies: NextUI and SpruceOS render
+# through SDL2's KMSDRM backend wherever a KMS driver exists, while stock
+# firmwares (and the tg5040, whose card0 is a GPU-only pvrsrvkm node with no
+# planes) use fbdev. So probe rather than guess.
+#
+# Usage:
+#   adb-screenshot <out.png> [-s SERIAL]
+#
+# Env:
+#   PIXFMT   override the ffmpeg input format (default bgr0)
+#   FORCE    "android", "kms" or "fb" to skip probing
+
+set -euo pipefail
+
+OUTPUT=""
+SERIAL=""
+PIXFMT="${PIXFMT:-bgr0}"
+FORCE="${FORCE:-}"
+CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/adb-screenshot"
+DEV_BIN="/tmp/drmshot"
+DEV_RAW="/tmp/adb-shot.raw"
+
+die() { echo "error: $*" >&2; exit 1; }
+
+while [ $# -gt 0 ]; do
+    case "$1" in
+        -s) SERIAL="${2:-}"; shift 2 ;;
+        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -*) die "unknown option $1" ;;
+        *)  [ -z "$OUTPUT" ] || die "only one output file"; OUTPUT="$1"; shift ;;
+    esac
+done
+[ -n "$OUTPUT" ] || die "usage: adb-screenshot <out.png> [-s SERIAL]"
+
+ADB=(adb)
+[ -n "$SERIAL" ] && ADB=(adb -s "$SERIAL")
+
+adb_sh() { "${ADB[@]}" shell "$@" </dev/null | tr -d '\r'; }
+
+"${ADB[@]}" get-state >/dev/null 2>&1 || die "no device (adb get-state failed)"
+
+# ------------------------------------------------------------- drmshot source
+
+# Rewrites the source only when it actually changed, so its mtime stays
+# older than the cached binary and the build is skipped on later runs.
+write_source() {
+    cat > "$CACHE/drmshot.c.new" <<'EOF'
+/* Dump the currently scanned-out KMS framebuffer.
+ *
+ * Reads what the display engine is showing, so it needs no cooperation from
+ * the app. Requires root (CAP_SYS_ADMIN) for GETFB2 but not DRM master, so it
+ * works while an application owns the display.
+ *
+ * Raw ioctls rather than libdrm so the binary links statically and does not
+ * depend on what the rootfs ships.
+ */
+#define _GNU_SOURCE
+#include <errno.h>
+#include <fcntl.h>
+#include <stdint.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <sys/ioctl.h>
+#include <sys/mman.h>
+#include <unistd.h>
+
+#include <drm/drm.h>
+#include <drm/drm_mode.h>
+#include <linux/dma-buf.h>
+
+#ifndef DRM_IOCTL_MODE_GETFB2
+#define DRM_IOCTL_MODE_GETFB2 DRM_IOWR(0xCE, struct drm_mode_fb_cmd2)
+#endif
+
+static int die(const char *msg) {
+    fprintf(stderr, "drmshot: %s: %s\n", msg, strerror(errno));
+    return 1;
+}
+
+static int find_active_fb(int fd, uint32_t *fb_id) {
+    struct drm_mode_get_plane_res res;
+    memset(&res, 0, sizeof res);
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &res))
+        return die("GETPLANERESOURCES");
+    if (!res.count_planes) {
+        fprintf(stderr, "drmshot: no planes\n");
+        return 1;
+    }
+
+    uint32_t *ids = calloc(res.count_planes, sizeof *ids);
+    if (!ids)
+        return die("calloc");
+    res.plane_id_ptr = (uint64_t)(uintptr_t)ids;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETPLANERESOURCES, &res)) {
+        free(ids);
+        return die("GETPLANERESOURCES (ids)");
+    }
+
+    int found = 0;
+    for (uint32_t i = 0; i < res.count_planes && !found; i++) {
+        struct drm_mode_get_plane p;
+        memset(&p, 0, sizeof p);
+        p.plane_id = ids[i];
+        if (ioctl(fd, DRM_IOCTL_MODE_GETPLANE, &p))
+            continue;
+        if (p.fb_id && p.crtc_id) {
+            *fb_id = p.fb_id;
+            found = 1;
+        }
+    }
+    free(ids);
+    if (!found) {
+        fprintf(stderr, "drmshot: no plane is scanning out a framebuffer\n");
+        return 1;
+    }
+    return 0;
+}
+
+int main(int argc, char **argv) {
+    const char *dev = "/dev/dri/card0";
+
+    if (argc < 2 || argc > 3) {
+        fprintf(stderr, "usage: drmshot <out.raw> [/dev/dri/cardN]\n");
+        return 2;
+    }
+    const char *out = argv[1];
+    if (argc == 3)
+        dev = argv[2];
+
+    int fd = open(dev, O_RDWR | O_CLOEXEC);
+    if (fd < 0)
+        return die(dev);
+
+    /* Primary planes are hidden from clients that do not ask for them. */
+    struct drm_set_client_cap cap = { .capability = DRM_CLIENT_CAP_UNIVERSAL_PLANES,
+                                      .value      = 1 };
+    ioctl(fd, DRM_IOCTL_SET_CLIENT_CAP, &cap);
+
+    uint32_t fb_id = 0;
+    if (find_active_fb(fd, &fb_id))
+        return 1;
+
+    struct drm_mode_fb_cmd2 fb;
+    memset(&fb, 0, sizeof fb);
+    fb.fb_id = fb_id;
+    if (ioctl(fd, DRM_IOCTL_MODE_GETFB2, &fb))
+        return die("GETFB2 (root required)");
+
+    if (fb.modifier[0]) {
+        fprintf(stderr, "drmshot: framebuffer is tiled/compressed "
+                        "(modifier 0x%llx), cannot read linearly\n",
+                (unsigned long long)fb.modifier[0]);
+        return 1;
+    }
+    if (!fb.handles[0]) {
+        fprintf(stderr, "drmshot: no GEM handle (need root)\n");
+        return 1;
+    }
+
+    struct drm_prime_handle prime;
+    memset(&prime, 0, sizeof prime);
+    prime.handle = fb.handles[0];
+    prime.flags  = DRM_CLOEXEC | DRM_RDWR;
+    if (ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime)) {
+        prime.flags = DRM_CLOEXEC;
+        if (ioctl(fd, DRM_IOCTL_PRIME_HANDLE_TO_FD, &prime))
+            return die("PRIME_HANDLE_TO_FD");
+    }
+
+    size_t size = (size_t)fb.pitches[0] * fb.height + fb.offsets[0];
+    void *map = mmap(NULL, size, PROT_READ, MAP_SHARED, prime.fd, 0);
+    if (map == MAP_FAILED)
+        return die("mmap");
+
+    /* Without this the CPU can read stale cache lines for the frame. */
+    struct dma_buf_sync sync = { .flags = DMA_BUF_SYNC_START | DMA_BUF_SYNC_READ };
+    ioctl(prime.fd, DMA_BUF_IOCTL_SYNC, &sync);
+
+    FILE *f = fopen(out, "wb");
+    if (!f)
+        return die(out);
+
+    const uint8_t *base = (const uint8_t *)map + fb.offsets[0];
+    size_t row = (size_t)fb.width * 4;
+    int ok = 1;
+    for (uint32_t y = 0; y < fb.height && ok; y++)
+        ok = fwrite(base + (size_t)y * fb.pitches[0], 1, row, f) == row;
+    if (fclose(f) != 0)
+        ok = 0;
+
+    sync.flags = DMA_BUF_SYNC_END | DMA_BUF_SYNC_READ;
+    ioctl(prime.fd, DMA_BUF_IOCTL_SYNC, &sync);
+    munmap(map, size);
+
+    struct drm_gem_close gc = { .handle = fb.handles[0] };
+    ioctl(fd, DRM_IOCTL_GEM_CLOSE, &gc);
+    close(prime.fd);
+    close(fd);
+
+    if (!ok) {
+        fprintf(stderr, "drmshot: short write to %s\n", out);
+        return 1;
+    }
+
+    char fourcc[5] = {
+        (char)(fb.pixel_format & 0xff),
+        (char)((fb.pixel_format >> 8) & 0xff),
+        (char)((fb.pixel_format >> 16) & 0xff),
+        (char)((fb.pixel_format >> 24) & 0xff),
+        0
+    };
+    printf("%u %u %s\n", fb.width, fb.height, fourcc);
+    return 0;
+}
+EOF
+    if cmp -s "$CACHE/drmshot.c.new" "$CACHE/drmshot.c"; then
+        rm -f "$CACHE/drmshot.c.new"
+    else
+        mv "$CACHE/drmshot.c.new" "$CACHE/drmshot.c"
+    fi
+}
+
+# Static, and built with the toolchain carrying the lowest kernel floor. Static
+# glibc refuses to start below its build-time floor ("FATAL: kernel too old"),
+# which rules the tg5040 out - but that device has no KMS anyway and falls
+# through to fbdev, so one binary suffices.
+build_drmshot() {
+    mkdir -p "$CACHE"
+    write_source
+    if [ -f "$CACHE/drmshot" ] && [ "$CACHE/drmshot" -nt "$CACHE/drmshot.c" ]; then
+        return
+    fi
+    command -v docker >/dev/null || die "docker needed to cross-compile drmshot"
+    echo "Building drmshot..." >&2
+    docker run --rm -v "$CACHE:/work" -w /work \
+        ghcr.io/loveretro/tg5040-toolchain:latest \
+        bash -lc '${CROSS_COMPILE}gcc -O2 -Wall -Wextra -static -o drmshot drmshot.c \
+                  && ${CROSS_COMPILE}strip -s drmshot' >/dev/null
+    [ -f "$CACHE/drmshot" ] || die "drmshot build produced no output"
+}
+
+# ------------------------------------------------------------------ capture
+
+convert_raw() {
+    local raw="$1" w="$2" h="$3"
+    ffmpeg -y -f rawvideo -pix_fmt "$PIXFMT" -s "${w}x${h}" -i "$raw" \
+           "$OUTPUT" 2>/dev/null || die "ffmpeg failed to convert the frame"
+}
+
+# Android ships its own capture tool; prefer it over poking at the hardware,
+# since it composites through SurfaceFlinger and respects rotation.
+try_android() {
+    adb_sh "command -v screencap" | grep -q screencap || return 1
+
+    # exec-out, not shell: the shell transport mangles binary with CRLF.
+    if [ "${OUTPUT##*.}" = "png" ]; then
+        "${ADB[@]}" exec-out screencap -p > "$OUTPUT" 2>/dev/null \
+            || die "screencap failed"
+        [ -s "$OUTPUT" ] || die "screencap produced an empty file"
+    else
+        local png
+        png="$(dirname "$OUTPUT")/.adb-shot-$$.png"
+        # shellcheck disable=SC2064
+        trap "rm -f '$png'" EXIT
+        "${ADB[@]}" exec-out screencap -p > "$png" 2>/dev/null \
+            || die "screencap failed"
+        [ -s "$png" ] || die "screencap produced an empty file"
+        ffmpeg -y -i "$png" "$OUTPUT" 2>/dev/null \
+            || die "ffmpeg failed to convert the capture"
+    fi
+    echo "android: screencap"
+}
+
+try_kms() {
+    build_drmshot
+    "${ADB[@]}" push "$CACHE/drmshot" "$DEV_BIN" >/dev/null 2>&1 || return 1
+
+    local info
+    info=$(adb_sh "chmod +x '$DEV_BIN'; '$DEV_BIN' '$DEV_RAW' 2>&1")
+    # Success prints "<w> <h> <fourcc>"; anything else is a reason to fall back.
+    if ! [[ $info =~ ^([0-9]+)\ ([0-9]+)\ ([A-Za-z0-9]+)$ ]]; then
+        echo "KMS capture unavailable: ${info:-no output}" >&2
+        return 1
+    fi
+    local w=${BASH_REMATCH[1]} h=${BASH_REMATCH[2]} fourcc=${BASH_REMATCH[3]}
+
+    local raw
+    raw="$(dirname "$OUTPUT")/.adb-shot-$$.raw"
+    # shellcheck disable=SC2064
+    trap "rm -f '$raw'" EXIT
+    "${ADB[@]}" pull "$DEV_RAW" "$raw" >/dev/null 2>&1 || die "pull failed"
+    adb_sh "rm -f '$DEV_RAW'" >/dev/null
+
+    echo "KMS: ${w}x${h} $fourcc"
+    convert_raw "$raw" "$w" "$h"
+}
+
+try_fb() {
+    local virt bpp mode pan
+    read -r virt bpp mode pan < <(
+        adb_sh "cat /sys/class/graphics/fb0/virtual_size \
+                    /sys/class/graphics/fb0/bits_per_pixel \
+                    /sys/class/graphics/fb0/modes \
+                    /sys/class/graphics/fb0/pan" | paste -sd' '
+    )
+    local xvirt=${virt%,*}
+    local geom=${mode#*:}
+    local w=${geom%%x*}
+    local h=${geom#*x}; h=${h%%[!0-9]*}
+    local pan_y=${pan#*,}
+
+    local v
+    for v in xvirt w h pan_y bpp; do
+        [[ ${!v} =~ ^[0-9]+$ ]] || die "bad fb0 $v: '${!v}'"
+    done
+
+    local bytes=$((bpp / 8))
+    # Derived, not read from fb0/stride: some drivers report a line_length that
+    # contradicts the real framebuffer size.
+    local stride=$((xvirt * bytes))
+
+    echo "fbdev: ${w}x${h} (virtual ${xvirt}), pan_y=${pan_y}, stride=${stride}"
+    adb_sh "dd if=/dev/fb0 of='$DEV_RAW' bs=$stride skip=$pan_y count=$h 2>/dev/null"
+
+    local raw
+    raw="$(dirname "$OUTPUT")/.adb-shot-$$.raw"
+    # shellcheck disable=SC2064
+    trap "rm -f '$raw'" EXIT
+    "${ADB[@]}" pull "$DEV_RAW" "$raw" >/dev/null 2>&1 || die "pull failed"
+    adb_sh "rm -f '$DEV_RAW'" >/dev/null
+
+    if [ "$(tr -d '\0' < "$raw" | wc -c)" -eq 0 ]; then
+        die "fb0 is entirely zeros and KMS capture did not work either"
+    fi
+
+    if [ "$xvirt" -ne "$w" ]; then
+        ffmpeg -y -f rawvideo -pix_fmt "$PIXFMT" -s "${xvirt}x${h}" -i "$raw" \
+               -vf "crop=${w}:${h}:0:0" "$OUTPUT" 2>/dev/null \
+            || die "ffmpeg failed to convert the frame"
+    else
+        convert_raw "$raw" "$w" "$h"
+    fi
+}
+
+mkdir -p "$(dirname "$OUTPUT")"
+case "$FORCE" in
+    android) try_android || die "forced screencap capture failed" ;;
+    kms)     try_kms || die "forced KMS capture failed" ;;
+    fb)      try_fb ;;
+    "")      try_android || try_kms || try_fb ;;
+    *)       die "FORCE must be 'android', 'kms' or 'fb'" ;;
+esac
+
+echo "Saved: $OUTPUT"
