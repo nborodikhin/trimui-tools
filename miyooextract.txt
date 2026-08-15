@@ -1,0 +1,5 @@
+Utility to extract root filesystem from a Miyoo Flip firmware image
+Tested on Linux
+
+Official firmware and toolchains: https://lomiyoo.com/pages/firmware
+See also: https://github.com/Zetarancio/Miyoo-Flip-Mainline-Linux-Reverse-Engineering

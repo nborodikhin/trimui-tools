@@ -1,0 +1,99 @@
+#!/usr/bin/env bash
+#
+# miyooextract - unpack a Miyoo Flip MY355 fixed-offset firmware image.
+#
+# It does two things:
+#   1. Writes every stored region to <outdir>/ (version-script.bin, uboot.img,
+#      boot.img, and rootfs.img).
+#   2. Produces rootfs.img.tar.gz containing the SquashFS filesystem contents.
+#
+# Usage:
+#   miyooextract <miyoo355_fw.img> [outdir]  unpack regions (+ rootfs tar.gz)
+#   miyooextract -l|--list <image>           just list the firmware layout
+#
+# outdir defaults to the image basename without its extension.
+#
+# Dependencies: dd, tar, unsquashfs (squashfs-tools). Run as root only when
+# exact original UID/GID ownership is required in the generated archive.
+#
+set -euo pipefail
+
+prog=${0##*/}
+die(){ echo "$prog: $*" >&2; exit 1; }
+usage(){ sed -n '3,18p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-1}"; }
+
+LIST_ONLY=0; ARGS=()
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage 0 ;;
+    -l|--list) LIST_ONLY=1; shift ;;
+    --)        shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done ;;
+    -*)        die "unknown option: $1" ;;
+    *)         ARGS+=("$1"); shift ;;
+  esac
+done
+[ "${#ARGS[@]}" -ge 1 ] || usage 1
+[ "${#ARGS[@]}" -le 2 ] || die "too many arguments"
+IMG=${ARGS[0]}; [ -f "$IMG" ] || die "no such file: $IMG"
+OUTDIR=${ARGS[1]:-}
+if [ -z "$OUTDIR" ]; then b=${IMG##*/}; OUTDIR=${b%.*}; fi
+
+MIB=$((1024 * 1024))
+IMAGE_SIZE=$(wc -c < "$IMG")
+ROOT_OFF=$((80 * MIB))
+(( IMAGE_SIZE > ROOT_OFF + 48 )) || die "image is too small for the MY355 layout"
+
+read_magic(){ od -An -tx1 -N4 -j "$1" "$IMG" | tr -d ' \n'; }
+[[ $(head -c 14 "$IMG") == 'model:miyoo355' ]] || die "not a Miyoo MY355 firmware image"
+[[ $(read_magic $((1 * MIB))) == d00dfeed ]] || die "missing Rockchip FIT image at 1 MiB"
+[[ $(dd if="$IMG" bs=1 skip=$((8 * MIB)) count=8 status=none) == 'ANDROID!' ]] || die "missing Android boot image at 8 MiB"
+[[ $(read_magic "$ROOT_OFF") == 68737173 ]] || die "missing SquashFS rootfs at 80 MiB"
+
+# index, name, byte offset, stored byte length, recognized type
+ROWS=(
+  $'0\tversion-script.bin\t0\t1048576\tmetadata'
+  $'1\tuboot.img\t1048576\t7340032\trockchip-fit'
+  $'2\tboot.img\t8388608\t75497472\tandroid-boot'
+  $'3\trootfs.img\t83886080\t'"$((IMAGE_SIZE - ROOT_OFF))"$'\tsquashfs'
+)
+
+if [ "$LIST_ONLY" = 1 ]; then
+  printf '%-3s %-22s %12s %12s  %s\n' '#' NAME OFFSET LENGTH TYPE
+  for row in "${ROWS[@]}"; do
+    IFS=$'\t' read -r idx name off len typ <<<"$row"
+    printf '%-3s %-22s %12s %12s  [%s]\n' "$idx" "$name" "$off" "$len" "$typ"
+  done
+  exit 0
+fi
+
+for cmd in dd tar unsquashfs mktemp; do
+  command -v "$cmd" >/dev/null || die "$cmd not found"
+done
+[ ! -e "$OUTDIR" ] || die "output path already exists: $OUTDIR"
+mkdir -p "$OUTDIR"
+TMPROOT="$OUTDIR/.miyooextract_tmp"
+mkdir "$TMPROOT"
+cleanup(){
+  chmod -R u+w "$TMPROOT" 2>/dev/null || true
+  rm -rf "$TMPROOT" 2>/dev/null || true
+}
+trap cleanup EXIT HUP INT TERM
+
+echo "$prog: unpacking '$IMG' -> $OUTDIR/" >&2
+for row in "${ROWS[@]}"; do
+  IFS=$'\t' read -r idx name off len typ <<<"$row"
+  dest="$OUTDIR/$name"
+  dd if="$IMG" of="$dest" bs=4M iflag=skip_bytes,count_bytes \
+    skip="$off" count="$len" status=none
+  printf '  [%2s] %-22s %10s bytes' "$idx" "$name" "$len" >&2
+  if [ "$typ" = squashfs ]; then
+    printf '  (squashfs -> %s.tar.gz)\n' "$name" >&2
+    root="$TMPROOT/rootfs"
+    unsquashfs -no-progress -strict-errors -dest "$root" "$dest"
+    tar --numeric-owner --xattrs --acls -p -C "$root" -zcf "$dest.tar.gz" .
+  else
+    printf '\n' >&2
+  fi
+done
+
+echo "$prog: done. ${#ROWS[@]} region(s) written, 1 filesystem tarred, in $OUTDIR/" >&2
