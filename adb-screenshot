@@ -45,7 +45,14 @@ ADB=(adb)
 
 adb_sh() { "${ADB[@]}" shell "$@" </dev/null | tr -d '\r'; }
 
-"${ADB[@]}" get-state >/dev/null 2>&1 || die "no device (adb get-state failed)"
+if ! ADB_ERROR=$("${ADB[@]}" get-state 2>&1 >/dev/null); then
+    if [[ "$ADB_ERROR" == *"more than one device"* ]]; then
+        echo "error: multiple devices connected; select one with -s SERIAL:" >&2
+        adb devices | awk 'NR > 1 && NF { printf "  %s\t%s\n", $1, $2 }' >&2
+        exit 1
+    fi
+    die "adb get-state failed: ${ADB_ERROR:-unknown error}"
+fi
 
 # ------------------------------------------------------------- drmshot source
 
