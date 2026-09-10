@@ -13,6 +13,7 @@
 #
 # Usage:
 #   adb-screenshot <out.png> [-s SERIAL]
+#   adb-screenshot -l
 #
 # Env:
 #   PIXFMT   override the ffmpeg input format (default bgr0)
@@ -22,6 +23,7 @@ set -euo pipefail
 
 OUTPUT=""
 SERIAL=""
+LIST_DEVICES=false
 PIXFMT="${PIXFMT:-bgr0}"
 FORCE="${FORCE:-}"
 CACHE="${XDG_CACHE_HOME:-$HOME/.cache}/adb-screenshot"
@@ -33,11 +35,57 @@ die() { echo "error: $*" >&2; exit 1; }
 while [ $# -gt 0 ]; do
     case "$1" in
         -s) SERIAL="${2:-}"; shift 2 ;;
-        -h|--help) sed -n '2,18p' "$0" | sed 's/^# \?//'; exit 0 ;;
+        -l) LIST_DEVICES=true; shift ;;
+        -h|--help)
+            awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0"
+            exit 0
+            ;;
         -*) die "unknown option $1" ;;
         *)  [ -z "$OUTPUT" ] || die "only one output file"; OUTPUT="$1"; shift ;;
     esac
 done
+
+list_devices() {
+    local devices line serial state model field probed_model
+    devices=$(adb devices -l)
+
+    while IFS= read -r line; do
+        [[ -n "$line" && "$line" != "List of devices attached"* ]] || continue
+        read -r serial state _ <<< "$line"
+
+        model="unknown"
+        for field in $line; do
+            if [[ "$field" == model:* ]]; then
+                model=${field#model:}
+                break
+            fi
+        done
+
+        # Linux handheld firmware often gives adbd a placeholder Android model.
+        # Prefer Android's product model when available, otherwise the Linux
+        # device-tree model, and retain `adb devices -l` as a fallback.
+        if [[ "$state" == device ]]; then
+            probed_model=$(adb -s "$serial" shell '
+                if command -v getprop >/dev/null 2>&1; then
+                    getprop ro.product.model
+                elif [ -r /etc/model ]; then
+                    cat /etc/model
+                elif [ -r /sys/firmware/devicetree/base/model ]; then
+                    tr -d "\000\r\n" </sys/firmware/devicetree/base/model
+                fi
+            ' </dev/null 2>/dev/null | tr -d '\r') || true
+            [[ -z "$probed_model" ]] || model=$probed_model
+        fi
+
+        printf "  %s\t%s\t%s\n" "$serial" "$state" "$model"
+    done <<< "$devices"
+}
+
+if "$LIST_DEVICES"; then
+    list_devices
+    exit 0
+fi
+
 [ -n "$OUTPUT" ] || die "usage: adb-screenshot <out.png> [-s SERIAL]"
 
 ADB=(adb)
@@ -48,7 +96,7 @@ adb_sh() { "${ADB[@]}" shell "$@" </dev/null | tr -d '\r'; }
 if ! ADB_ERROR=$("${ADB[@]}" get-state 2>&1 >/dev/null); then
     if [[ "$ADB_ERROR" == *"more than one device"* ]]; then
         echo "error: multiple devices connected; select one with -s SERIAL:" >&2
-        adb devices | awk 'NR > 1 && NF { printf "  %s\t%s\n", $1, $2 }' >&2
+        list_devices >&2
         exit 1
     fi
     die "adb get-state failed: ${ADB_ERROR:-unknown error}"
