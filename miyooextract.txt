@@ -1,5 +1,8 @@
 Utility to extract root filesystem from a Miyoo Flip firmware image
 Tested on Linux
 
+Use --xz to produce rootfs.img.tar.xz instead of rootfs.img.tar.gz.
+Requires xz in addition to the default dependencies.
+
 Official firmware and toolchains: https://lomiyoo.com/pages/firmware
 See also: https://github.com/Zetarancio/Miyoo-Flip-Mainline-Linux-Reverse-Engineering

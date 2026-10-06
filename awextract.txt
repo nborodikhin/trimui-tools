@@ -1,4 +1,7 @@
 Utility to extract root filesystem from a AllWinner image format used for TrimUI devices (Brick, TSP, TSPS).
 Tested on Linux
 
+Use --xz to produce filesystem archives as .tar.xz instead of .tar.gz.
+Requires xz in addition to the default dependencies.
+
 Official firmware and toolchains: https://github.com/trimui

@@ -12,6 +12,7 @@
 #   miyooextract -l|--list <image>           just list the firmware layout
 #
 # outdir defaults to the image basename without its extension.
+# Use --xz to produce .tar.xz instead of .tar.gz (requires xz).
 #
 # Dependencies: dd, tar, unsquashfs (squashfs-tools). Run as root only when
 # exact original UID/GID ownership is required in the generated archive.
@@ -20,13 +21,14 @@ set -euo pipefail
 
 prog=${0##*/}
 die(){ echo "$prog: $*" >&2; exit 1; }
-usage(){ sed -n '3,18p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-1}"; }
+usage(){ sed -n '3,19p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-1}"; }
 
-LIST_ONLY=0; ARGS=()
+LIST_ONLY=0; ARGS=(); COMPRESS=(-z); ARCHIVE_EXT=tar.gz
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage 0 ;;
     -l|--list) LIST_ONLY=1; shift ;;
+    --xz)      COMPRESS=(-J); ARCHIVE_EXT=tar.xz; shift ;;
     --)        shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done ;;
     -*)        die "unknown option: $1" ;;
     *)         ARGS+=("$1"); shift ;;
@@ -66,6 +68,9 @@ if [ "$LIST_ONLY" = 1 ]; then
   exit 0
 fi
 
+if [ "$ARCHIVE_EXT" = tar.xz ]; then
+  command -v xz >/dev/null || die "xz not found"
+fi
 for cmd in dd tar unsquashfs mktemp; do
   command -v "$cmd" >/dev/null || die "$cmd not found"
 done
@@ -87,10 +92,10 @@ for row in "${ROWS[@]}"; do
     skip="$off" count="$len" status=none
   printf '  [%2s] %-22s %10s bytes' "$idx" "$name" "$len" >&2
   if [ "$typ" = squashfs ]; then
-    printf '  (squashfs -> %s.tar.gz)\n' "$name" >&2
+    printf '  (squashfs -> %s.%s)\n' "$name" "$ARCHIVE_EXT" >&2
     root="$TMPROOT/rootfs"
     unsquashfs -no-progress -strict-errors -dest "$root" "$dest"
-    tar --numeric-owner --xattrs --acls -p -C "$root" -zcf "$dest.tar.gz" .
+    tar --numeric-owner --xattrs --acls -p -C "$root" "${COMPRESS[@]}" -cf "$dest.$ARCHIVE_EXT" .
   else
     printf '\n' >&2
   fi

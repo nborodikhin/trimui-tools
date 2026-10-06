@@ -18,6 +18,7 @@
 #   awextract -l|--list <image.awimg>    just list the IMAGEWTY file table
 #
 # outdir defaults to the image basename without its extension.
+# Use --xz to produce .tar.xz instead of .tar.gz (requires xz).
 #
 # Dependencies:
 #   python3      parse the IMAGEWTY file table
@@ -31,13 +32,14 @@
 set -euo pipefail
 prog=${0##*/}
 die(){ echo "$prog: $*" >&2; exit 1; }
-usage(){ sed -n '3,26p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-1}"; }
+usage(){ sed -n '3,27p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-1}"; }
 
-LIST_ONLY=0; ARGS=()
+LIST_ONLY=0; ARGS=(); COMPRESS=(-z); ARCHIVE_EXT=tar.gz
 while [ $# -gt 0 ]; do
   case "$1" in
     -h|--help) usage 0 ;;
     -l|--list) LIST_ONLY=1; shift ;;
+    --xz)      COMPRESS=(-J); ARCHIVE_EXT=tar.xz; shift ;;
     --)        shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done ;;
     -*)        die "unknown option: $1" ;;
     *)         ARGS+=("$1"); shift ;;
@@ -95,6 +97,9 @@ if [ "$LIST_ONLY" = 1 ]; then
 fi
 
 command -v dd >/dev/null || die "dd not found"
+if [ "$ARCHIVE_EXT" = tar.xz ]; then
+  command -v xz >/dev/null || die "xz not found"
+fi
 mkdir -p "$OUTDIR"
 TMPROOT="$OUTDIR/.awextract_mnt"; mkdir -p "$TMPROOT"
 cleanup(){
@@ -105,11 +110,11 @@ cleanup(){
 }
 trap cleanup EXIT
 
-GZ=(-z)
-
-# rootless mount of a filesystem blob + tar.gz of its contents
-fs_to_targz(){    # <blob> <ext|fat|sparse> <out.tar.gz>
+# rootless mount of a filesystem blob + compressed tar of its contents
+fs_to_tar(){    # <blob> <ext|fat|sparse> <out.tar.gz|out.tar.xz>
   local blob=$1 typ=$2 out=$3 mnt raw="" ok=0
+  local -a metadata=(--xattrs)
+  [ "$typ" != fat ] || metadata=()
   mnt=$(mktemp -d "$TMPROOT/m.XXXXXX")
   case "$typ" in
     ext)    fuse2fs -o ro,fakeroot "$blob" "$mnt" >/dev/null 2>&1 && ok=1 ;;
@@ -119,8 +124,8 @@ fs_to_targz(){    # <blob> <ext|fat|sparse> <out.tar.gz>
               fuse2fs -o ro,fakeroot "$raw" "$mnt" >/dev/null 2>&1 && ok=1
             fi ;;
   esac
-  if [ "$ok" != 1 ]; then echo "    ! mount failed ($typ); skipping tar.gz" >&2; rmdir "$mnt" 2>/dev/null; [ -n "$raw" ] && rm -f "$raw"; return 1; fi
-  tar --numeric-owner --xattrs -p -C "$mnt" "${GZ[@]}" -cf "$out" . 2>/dev/null; local rc=$?
+  if [ "$ok" != 1 ]; then echo "    ! mount failed ($typ); skipping $ARCHIVE_EXT" >&2; rmdir "$mnt" 2>/dev/null; [ -n "$raw" ] && rm -f "$raw"; return 1; fi
+  tar --numeric-owner "${metadata[@]}" -p -C "$mnt" "${COMPRESS[@]}" -cf "$out" . 2>/dev/null; local rc=$?
   fusermount3 -u "$mnt" 2>/dev/null || fusermount -u "$mnt" 2>/dev/null || true
   rmdir "$mnt" 2>/dev/null
   [ -n "$raw" ] && rm -f "$raw"
@@ -140,8 +145,8 @@ for r in "${ROWS[@]}"; do
   dd if="$IMG" of="$dest" bs=4M iflag=skip_bytes,count_bytes skip="$off" count="$len" status=none
   printf '  [%2s] %-22s %10s bytes' "$idx" "${dest#$OUTDIR/}" "$len" >&2
   if [ "$typ" != - ]; then
-    printf '  (%s fs -> %s.tar.gz)\n' "$typ" "${dest#$OUTDIR/}" >&2
-    fs_to_targz "$dest" "$typ" "$dest.tar.gz" && nfs=$((nfs+1))
+    printf '  (%s fs -> %s.%s)\n' "$typ" "${dest#$OUTDIR/}" "$ARCHIVE_EXT" >&2
+    fs_to_tar "$dest" "$typ" "$dest.$ARCHIVE_EXT" && nfs=$((nfs+1))
   else
     printf '\n' >&2
   fi
