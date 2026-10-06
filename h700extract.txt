@@ -1,0 +1,19 @@
+Utility to extract partitions and filesystem archives from official Anbernic H700 SD-card firmware images.
+Tested on Linux with RG34XX-V1.0.6-EN16GB-260526.IMG.
+
+Usage: h700extract <firmware.IMG> [outdir]
+List disk regions: h700extract --list <firmware.IMG>
+Extract raw images without FUSE: h700extract --raw-only <firmware.IMG> [outdir]
+Use xz compression: h700extract --xz <firmware.IMG> [outdir]
+
+Reads and validates the GPT rather than assuming fixed partition offsets.
+Writes each partition as <partition-name>.img and FAT/ext filesystem contents as
+<partition-name>.img.tar.gz. Keeps the disk prefix, suffix, and gaps as raw images
+to retain bootloaders and partition tables. Raw output uses sparse files to avoid
+allocating space for zero-filled regions. The output directory must not exist.
+
+Dependencies: python3, GNU dd, tar, fuse2fs, fusefat, fusermount3 (or fusermount).
+Filesystem archives require /dev/fuse; mounts are read-only and need no sudo.
+Archive or mount failures stop extraction with a nonzero exit status; any output
+already written is retained. --raw-only requires only python3 and GNU dd.
+--xz produces .tar.xz instead of .tar.gz and requires xz when creating archives.

@@ -1,0 +1,231 @@
+#!/usr/bin/env bash
+#
+# h700extract - unpack an Anbernic H700 official firmware SD-card image.
+#
+# Writes GPT partitions to <outdir>/<partition-name>.img, and archives ext2/3/4
+# and FAT filesystem contents as <partition-name>.img.tar.gz. Also saves the
+# disk prefix (GPT and Allwinner bootloaders), suffix (backup GPT), and any gaps
+# as raw .img files, so bytes outside the partitions are retained.
+#
+# Usage:
+#   h700extract <firmware.IMG> [outdir]  unpack regions and filesystem archives
+#   h700extract -l|--list <image>       just list the disk layout
+#   h700extract --raw-only <image> [outdir]  unpack without filesystem archives
+#
+# outdir defaults to the image basename without its extension. It must not exist.
+# Use --xz to produce .tar.xz instead of .tar.gz (requires xz).
+# Filesystems are mounted read-only via FUSE; no sudo required. Archives retain
+# numeric ownership and modes (FAT has no Unix ownership or permission metadata).
+#
+# Dependencies: python3, GNU dd, tar, fuse2fs (ext), fusefat (FAT), and
+# fusermount3 or fusermount. Listing needs only python3; --raw-only also needs dd.
+#
+set -euo pipefail
+prog=${0##*/}
+die(){ echo "$prog: $*" >&2; exit 1; }
+usage(){ sed -n '3,21p' "$0" | sed 's/^#\( \|$\)//'; exit "${1:-1}"; }
+
+LIST_ONLY=0; RAW_ONLY=0; ARGS=(); COMPRESS=(-z); ARCHIVE_EXT=tar.gz
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -h|--help) usage 0 ;;
+    -l|--list) LIST_ONLY=1; shift ;;
+    --xz) COMPRESS=(-J); ARCHIVE_EXT=tar.xz; shift ;;
+    --raw-only) RAW_ONLY=1; shift ;;
+    --) shift; while [ $# -gt 0 ]; do ARGS+=("$1"); shift; done ;;
+    -*) die "unknown option: $1" ;;
+    *) ARGS+=("$1"); shift ;;
+  esac
+done
+[ "${#ARGS[@]}" -ge 1 ] || usage 1
+[ "${#ARGS[@]}" -le 2 ] || die "too many arguments"
+IMG=${ARGS[0]}; [ -f "$IMG" ] || die "no such file: $IMG"
+OUTDIR=${ARGS[1]:-}
+if [ -z "$OUTDIR" ]; then b=${IMG##*/}; OUTDIR=${b%.*}; fi
+command -v python3 >/dev/null || die "python3 not found"
+
+# Parse and validate before creating output. Capture the parser's exit status,
+# which would be lost with mapfile reading directly from process substitution.
+TABLE=$(python3 - "$IMG" <<'PY'
+import os
+import re
+import struct
+import sys
+import zlib
+
+def fail(message):
+    raise ValueError(message)
+
+try:
+    with open(sys.argv[1], 'rb') as f:
+        size = os.fstat(f.fileno()).st_size
+        def read(offset, length):
+            if offset < 0 or offset + length > size:
+                fail('image is truncated or a disk region is out of bounds')
+            f.seek(offset)
+            data = f.read(length)
+            if len(data) != length:
+                fail('short read from image')
+            return data
+
+        mbr = read(0, 512)
+        if mbr[510:512] != b'\x55\xaa' or not any(
+                mbr[446 + i * 16 + 4] == 0xee for i in range(4)):
+            fail('missing protective MBR')
+        header = read(512, 512)
+        if header[:8] != b'EFI PART':
+            fail('not a GPT firmware disk image')
+        revision, hsize, crc = struct.unpack_from('<III', header, 8)
+        if revision != 0x10000 or not 92 <= hsize <= 512:
+            fail('unsupported GPT header')
+        check = bytearray(header[:hsize])
+        check[16:20] = bytes(4)
+        if zlib.crc32(check) != crc:
+            fail('GPT header checksum mismatch')
+        current, backup, first_usable, last_usable = struct.unpack_from('<QQQQ', header, 24)
+        table_lba, count, entry_size, table_crc = struct.unpack_from('<QIII', header, 72)
+        if (size % 512 or current != 1 or backup != size // 512 - 1 or
+                not 2 <= first_usable <= last_usable < backup):
+            fail('invalid GPT disk bounds or incomplete image')
+        if (entry_size < 128 or entry_size % 128 or count < 1 or
+                count * entry_size > 16 * 1024 * 1024):
+            fail('unsupported GPT partition table size')
+        if table_lba < 2 or table_lba * 512 + count * entry_size > first_usable * 512:
+            fail('GPT partition table overlaps usable disk space')
+        table = read(table_lba * 512, count * entry_size)
+        if zlib.crc32(table) != table_crc:
+            fail('GPT partition table checksum mismatch')
+        if read(8192 + 4, 8) != b'eGON.BT0':
+            fail('missing Allwinner eGON bootloader at 8 KiB')
+
+        def classify(offset, length):
+            b = read(offset, min(length, 2048))
+            if b[:8] == b'ANDROID!':
+                return 'android-boot'
+            if len(b) >= 1082 and b[1080:1082] == b'\x53\xef':
+                return 'ext'
+            if len(b) >= 512 and b[510:512] == b'\x55\xaa' and (
+                    b[54:62] in (b'FAT12   ', b'FAT16   ', b'FAT     ') or
+                    b[82:90] == b'FAT32   '):
+                return 'fat'
+            return 'raw'
+
+        partitions = []
+        used_names = {'disk-prefix.img', 'disk-suffix.img'}
+        for i in range(count):
+            e = table[i * entry_size:(i + 1) * entry_size]
+            if e[:16] == bytes(16):
+                continue
+            first, last = struct.unpack_from('<QQ', e, 32)
+            if not first_usable <= first <= last <= last_usable:
+                fail('partition %d is outside usable disk bounds' % (i + 1))
+            label = e[56:128].decode('utf-16-le').split('\0', 1)[0]
+            stem = re.sub(r'[^A-Za-z0-9_.-]', '_', label).strip('.') or 'partition-%d' % (i + 1)
+            if stem.startswith('disk-gap-'):
+                stem = 'partition-%d' % (i + 1)
+            name = stem + '.img'
+            while name in used_names:
+                stem += '-%d' % (i + 1)
+                name = stem + '.img'
+            used_names.add(name)
+            offset, length = first * 512, (last - first + 1) * 512
+            partitions.append((offset, length, name, classify(offset, length)))
+        if not partitions:
+            fail('no GPT partitions found')
+        partitions.sort()
+        regions = []
+        cursor = 0
+        for offset, length, name, kind in partitions:
+            if offset < cursor:
+                fail('overlapping GPT partitions')
+            if offset > cursor:
+                gap_name = 'disk-prefix.img' if cursor == 0 else 'disk-gap-%d.img' % len(regions)
+                regions.append((cursor, offset - cursor, gap_name, 'raw'))
+            regions.append((offset, length, name, kind))
+            cursor = offset + length
+        if cursor < size:
+            regions.append((cursor, size - cursor, 'disk-suffix.img', 'raw'))
+        for i, (offset, length, name, kind) in enumerate(regions):
+            print('%d\t%s\t%d\t%d\t%s' % (i, name, offset, length, kind))
+except (OSError, ValueError, struct.error) as error:
+    print('h700extract: ' + str(error), file=sys.stderr)
+    sys.exit(1)
+PY
+) || exit 1
+mapfile -t ROWS <<<"$TABLE"
+
+if [ "$LIST_ONLY" = 1 ]; then
+  printf '%-3s %-24s %14s %14s  %s\n' '#' NAME OFFSET LENGTH TYPE
+  for row in "${ROWS[@]}"; do
+    IFS=$'\t' read -r idx name off len typ <<<"$row"
+    printf '%-3s %-24s %14s %14s  [%s]\n' "$idx" "$name" "$off" "$len" "$typ"
+  done
+  exit 0
+fi
+
+command -v dd >/dev/null || die "dd not found"
+UNMOUNT=''
+if [ "$RAW_ONLY" = 0 ]; then
+  if [ "$ARCHIVE_EXT" = tar.xz ]; then
+    command -v xz >/dev/null || die "xz not found"
+  fi
+  command -v tar >/dev/null || die "tar not found"
+  if command -v fusermount3 >/dev/null; then UNMOUNT=fusermount3
+  elif command -v fusermount >/dev/null; then UNMOUNT=fusermount
+  else die "fusermount3 or fusermount not found (use --raw-only to skip archives)"; fi
+  for row in "${ROWS[@]}"; do
+    IFS=$'\t' read -r idx name off len typ <<<"$row"
+    case "$typ" in
+      ext) command -v fuse2fs >/dev/null || die "fuse2fs not found" ;;
+      fat) command -v fusefat >/dev/null || die "fusefat not found" ;;
+    esac
+  done
+  [ -c /dev/fuse ] || die "/dev/fuse unavailable (use --raw-only to skip archives)"
+fi
+[ ! -e "$OUTDIR" ] && [ ! -L "$OUTDIR" ] || die "output path already exists: $OUTDIR"
+mkdir -p -- "$OUTDIR"
+# Absolute paths also keep leading dashes out of mount and archive arguments.
+OUTDIR=$(cd -- "$OUTDIR" && pwd)
+TMPROOT="$OUTDIR/.h700extract_mnt"
+MOUNTED=0
+cleanup(){
+  if [ "$MOUNTED" = 1 ]; then
+    "$UNMOUNT" -u "$TMPROOT" || return 1
+    MOUNTED=0
+  fi
+  rmdir -- "$TMPROOT" 2>/dev/null || true
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+fs_to_tar(){
+  local blob=$1 typ=$2
+  local -a metadata=(--xattrs --acls)
+  [ "$typ" != fat ] || metadata=()
+  mkdir -- "$TMPROOT"
+  case "$typ" in
+    ext) fuse2fs -o ro,norecovery,fakeroot "$blob" "$TMPROOT" ;;
+    fat) fusefat -o ro "$blob" "$TMPROOT" ;;
+  esac
+  MOUNTED=1
+  tar --numeric-owner "${metadata[@]}" -p -C "$TMPROOT" "${COMPRESS[@]}" -cf "$blob.$ARCHIVE_EXT" .
+  cleanup
+}
+
+echo "$prog: unpacking '$IMG' -> $OUTDIR/" >&2
+nfs=0
+for row in "${ROWS[@]}"; do
+  IFS=$'\t' read -r idx name off len typ <<<"$row"
+  dest="$OUTDIR/$name"
+  dd if="$IMG" of="$dest" bs=4M iflag=skip_bytes,count_bytes \
+    skip="$off" count="$len" conv=sparse status=none
+  printf '  [%2s] %-24s %12s bytes [%s]\n' "$idx" "$name" "$len" "$typ" >&2
+  if [ "$RAW_ONLY" = 0 ] && [[ "$typ" = ext || "$typ" = fat ]]; then
+    echo "    archiving -> $name.$ARCHIVE_EXT" >&2
+    fs_to_tar "$dest" "$typ"
+    nfs=$((nfs+1))
+  fi
+done
+echo "$prog: done. ${#ROWS[@]} region(s) written, $nfs filesystem(s) tarred, in $OUTDIR/" >&2
