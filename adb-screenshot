@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Screenshot a handheld over adb: Android, or a TrimUI / Miyoo Linux device.
+# Screenshot a handheld over adb: Android, or a TrimUI / Miyoo / H700 Linux device.
 #
 # Three capture paths, probed in order:
 #   screencap  Android's own tool, via SurfaceFlinger (handles rotation/layers)
@@ -336,6 +336,10 @@ try_android() {
 }
 
 try_kms() {
+    # H700's vendor display driver exposes fbdev, not DRM. Check before
+    # requiring Docker or building/pushing a helper the device cannot use.
+    # Legacy adbd does not propagate the remote command's exit status.
+    [[ $(adb_sh "[ ! -e /dev/dri/card0 ] || echo kms") == kms ]] || return 1
     build_drmshot
     "${ADB[@]}" push "$CACHE/drmshot" "$DEV_BIN" >/dev/null 2>&1 || return 1
 
@@ -384,7 +388,11 @@ try_fb() {
     local stride=$((xvirt * bytes))
 
     echo "fbdev: ${w}x${h} (virtual ${xvirt}), pan_y=${pan_y}, stride=${stride}"
-    adb_sh "dd if=/dev/fb0 of='$DEV_RAW' bs=$stride skip=$pan_y count=$h 2>/dev/null"
+    # Keep a shell waiting for dd: legacy adbd can close the session early
+    # when the final command redirects stderr, truncating the framebuffer.
+    # A marker also reports failures on adbd versions without exit statuses.
+    [[ $(adb_sh "dd if=/dev/fb0 of='$DEV_RAW' bs=$stride skip=$pan_y count=$h 2>/dev/null && echo captured") == captured ]] \
+        || die "framebuffer dump failed"
 
     local raw
     raw="$(dirname "$OUTPUT")/.adb-shot-$$.raw"
